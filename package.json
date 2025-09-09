@@ -1,9 +1,8 @@
 {
   "name": "reversal-api",
-  "version": "2.0.1",
-  "description": "Enhanced Reversal Data Collection API for multi-timeframe reversals with archiving (Render-ready)",
+  "version": "2.0.4",
+  "description": "Enhanced Reversal Data Collection API (CommonJS, Render-ready)",
   "main": "reversal_api_server.js",
-  "type": "module",
   "scripts": {
     "start": "node reversal_api_server.js",
     "dev": "NODE_ENV=development node reversal_api_server.js"
