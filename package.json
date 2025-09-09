@@ -1,0 +1,23 @@
+{
+  "name": "reversal-api",
+  "version": "2.0.1",
+  "description": "Enhanced Reversal Data Collection API for multi-timeframe reversals with archiving (Render-ready)",
+  "main": "reversal_api_server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node reversal_api_server.js",
+    "dev": "NODE_ENV=development node reversal_api_server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "node-cron": "^3.0.3",
+    "pg": "^8.11.5",
+    "uuid": "^9.0.1",
+    "yahoo-finance2": "^2.13.7"
+  }
+}

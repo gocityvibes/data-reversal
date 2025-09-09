@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: reversal-api
+    env: node
+    plan: starter
+    autoDeploy: true
+    buildCommand: ""
+    startCommand: node reversal_api_server.js
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: reversal-db
+          property: connectionString
+      - key: SYMBOLS
+        value: ES=F,NQ=F
+      - key: TIMEFRAMES
+        value: 1m,5m
+      - key: RETENTION_DAYS
+        value: "120"
+      - key: SLICE_HOURS
+        value: "6"
+      - key: YAHOO_RATE_LIMIT_MS
+        value: "1000"
+      - key: TZ
+        value: America/New_York
+databases:
+  - name: reversal-db
+    plan: starter
