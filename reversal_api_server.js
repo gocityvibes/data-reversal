@@ -27,6 +27,162 @@ if (!fetchFn) {
 }
 
 const app = express();
+// ==== BEGIN: Neon Postgres Bootstrap ====
+// Requires: pg (installed via build command or package.json)
+const { Pool } = require('pg');
+
+// Make a Pool (Neon needs SSL)
+const pool = process.env.DATABASE_URL
+  ? new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: { rejectUnauthorized: false },
+    })
+  : null;
+
+// Create tables if missing (safe to run every boot)
+async function initDb() {
+  if (!pool) {
+    console.warn('[DB] DATABASE_URL not set — skipping DB init');
+    return;
+  }
+
+  const ddl = `
+  create table if not exists reversal_jobs (
+    id bigserial primary key,
+    started_at timestamptz not null default now(),
+    ended_at   timestamptz,
+    status     text not null default 'running',
+    notes      text
+  );
+
+  create table if not exists bars_1m (
+    symbol text not null,
+    ts timestamptz not null,
+    open double precision not null,
+    high double precision not null,
+    low  double precision not null,
+    close double precision not null,
+    volume bigint,
+    rsi double precision,
+    macd double precision,
+    ema9 double precision,
+    vwap double precision,
+    primary key (symbol, ts)
+  );
+
+  create table if not exists bars_5m (
+    symbol text not null,
+    ts timestamptz not null,
+    open double precision not null,
+    high double precision not null,
+    low  double precision not null,
+    close double precision not null,
+    volume bigint,
+    rsi double precision,
+    macd double precision,
+    ema9 double precision,
+    vwap double precision,
+    primary key (symbol, ts)
+  );
+
+  create table if not exists reversal_events (
+    id bigserial primary key,
+    symbol text not null,
+    timeframe text not null check (timeframe in ('1m','5m')),
+    ts timestamptz not null,
+    direction text not null check (direction in ('long','short')),
+    score double precision,
+    trend text,
+    outcome text,
+    meta jsonb,
+    created_at timestamptz not null default now()
+  );
+
+  create index if not exists ix_reversal_events_sym_tf_ts
+    on reversal_events(symbol, timeframe, ts);
+  `;
+
+  await pool.query(ddl);
+  const r = await pool.query('select now() as now');
+  console.log('✅ Postgres ready — server time:', r.rows[0].now);
+}
+
+// Helpers you can call from elsewhere in this file
+async function saveBar(tf, bar) {
+  if (!pool) return;
+  const table = tf === '1m' ? 'bars_1m' : 'bars_5m';
+  const q = `
+    insert into ${table}
+      (symbol, ts, open, high, low, close, volume, rsi, macd, ema9, vwap)
+    values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+    on conflict (symbol, ts) do update set
+      open=excluded.open, high=excluded.high, low=excluded.low,
+      close=excluded.close, volume=excluded.volume,
+      rsi=excluded.rsi, macd=excluded.macd, ema9=excluded.ema9, vwap=excluded.vwap
+  `;
+  await pool.query(q, [
+    bar.symbol,
+    bar.ts, // ISO string or Date
+    bar.open, bar.high, bar.low, bar.close,
+    bar.volume ?? null,
+    bar.rsi ?? null, bar.macd ?? null, bar.ema9 ?? null, bar.vwap ?? null,
+  ]);
+}
+
+async function saveReversal(evt) {
+  if (!pool) return null;
+  const q = `
+    insert into reversal_events
+      (symbol, timeframe, ts, direction, score, trend, outcome, meta)
+    values ($1,$2,$3,$4,$5,$6,$7,$8)
+    returning id
+  `;
+  const r = await pool.query(q, [
+    evt.symbol, evt.timeframe, evt.ts, evt.direction,
+    evt.score ?? null, evt.trend ?? null, evt.outcome ?? null,
+    evt.meta ? JSON.stringify(evt.meta) : null,
+  ]);
+  return r.rows[0].id;
+}
+
+// expose helpers if you want to use them elsewhere in this file
+global.__db = { pool, saveBar, saveReversal };
+
+// Health & debug routes
+app.get('/db/health', async (_req, res) => {
+  try {
+    if (!pool) return res.json({ ok: false, reason: 'no DATABASE_URL' });
+    const r = await pool.query('select 1 as ok');
+    res.json({ ok: true, result: r.rows[0].ok });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+app.get('/db/debug', (_req, res) => {
+  const raw = process.env.DATABASE_URL || '';
+  if (!raw) return res.json({ hasUrl: false });
+  try {
+    const u = new URL(raw);
+    const hasSSL = u.searchParams.get('sslmode') === 'require';
+    const userMasked = u.username ? u.username.replace(/.(?=.{2})/g, '*') : '';
+    res.json({
+      hasUrl: true,
+      protocol: u.protocol.replace(':',''),
+      host: u.hostname,
+      db: u.pathname.replace('/',''),
+      userMasked,
+      hasSSLRequire: hasSSL
+    });
+  } catch (e) {
+    res.json({ hasUrl: true, parseError: String(e) });
+  }
+});
+
+// Kick off DB init (fire-and-forget)
+initDb().catch(err => console.error('DB init failed:', err));
+// ==== END: Neon Postgres Bootstrap ====
+
 const port = process.env.PORT || 3000;
 
 // Configuration from environment
