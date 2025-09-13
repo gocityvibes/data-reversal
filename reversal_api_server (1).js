@@ -10,7 +10,8 @@
 
 const express = require('express');
 const cors = require('cors');
-const { Pool } = require('pg');                   // <-- only once
+const pg = require('pg');
+
 const yahooFinance = require('yahoo-finance2').default;
 const cron = require('node-cron');
 const { v4: uuidv4 } = require('uuid');
@@ -42,10 +43,11 @@ if (!connectionString) {
   process.exit(1);
 }
 
-const pool = new Pool({
+const pool = new pg.Pool({
   connectionString,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
 });
+
 
 // ---------- Reversal Detector ----------
 class ReversalDetector {
