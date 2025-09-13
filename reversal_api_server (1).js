@@ -2,31 +2,50 @@
 // Multi-timeframe (1m, 5m) with automated archive system
 // Production-ready Node.js Express server for Render / Node 18+
 
-/* Key fixes vs your draft:
-   - Align INSERT columns with DB schema (no undefined trend_points/bonus_points/etc.).
-   - Add simple scoring to populate base_points,total_points,point_tier.
-   - Fix SQL placeholders ($1, $2, ...) in /api/jobs, /api/stats, /api/reversals, /api/training.
-   - Guard optional DB objects (training_fingerprints, get_neighbor_patterns, refresh_training_view).
-   - Improve duration calculation for job_runs.
-   - Safe LIMIT handling with parameter binding.
+/* Key fixes vs prior drafts:
+   - Single pg import & single Pool instance (removes "Identifier 'Pool' has already been declared").
+   - Removed stray extra brace after `const app = express();`
+   - Centralized config, port, and middleware placed before use.
 */
 
 const express = require('express');
 const cors = require('cors');
-const { Pool } = require('pg');
+const { Pool } = require('pg');                   // <-- only once
 const yahooFinance = require('yahoo-finance2').default;
 const cron = require('node-cron');
 const { v4: uuidv4 } = require('uuid');
 require('dotenv').config();
 
 // Node 18+ has global fetch; add fallback just in case.
-let fetchFn = global.fetch;
-if (!fetchFn) {
-  fetchFn = (...args) => import('node-fetch').then(({default: f}) => f(...args));
-}
+let fetchFn = global.fetch || (async (...args) => (await import('node-fetch')).default(...args));
 
 const app = express();
+app.use(cors());
+app.use(express.json());
+
+// ---- Config (centralized) ----
+const config = {
+  symbols: ['ES=F'],
+  timeframes: ['1m', '5m'],
+  retentionDays: 45,
+  yahooRateLimit: 250,    // ms between calls to be polite
+  sliceHours: 6,          // size of backfill slices
+  timezone: 'America/New_York'
+};
+
+const port = process.env.PORT || 10000;
+
+// ---- Postgres (single instance only) ----
+const connectionString = process.env.DATABASE_URL;
+if (!connectionString) {
+  console.error('DATABASE_URL is required');
+  process.exit(1);
 }
+
+const pool = new Pool({
+  connectionString,
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+});
 
 // ---------- Reversal Detector ----------
 class ReversalDetector {
