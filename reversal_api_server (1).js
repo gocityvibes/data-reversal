@@ -1,23 +1,24 @@
-// Enhanced Reversal Data Collection API (Aligned to schema v2.0.1)
-// Multi-timeframe (1m, 5m) with automated archive system
-// Production-ready Node.js Express server for Render / Node 18+
+'use strict';
 
-/* Key fixes vs prior drafts:
-   - Single pg import & single Pool instance (removes "Identifier 'Pool' has already been declared").
-   - Removed stray extra brace after `const app = express();`
-   - Centralized config, port, and middleware placed before use.
+// Enhanced Reversal Data Collection API (schema v2.0.1)
+// Multi-timeframe (1m, 5m) with automated archive + stats
+// Node 18+ / Render compatible
+
+/* Header fixes:
+   - Use pg.Pool (no destructuring) to avoid duplicate 'Pool' identifier collisions.
+   - No stray braces after app initialization.
+   - config, port, pool defined before any use.
 */
 
 const express = require('express');
 const cors = require('cors');
-const pg = require('pg');
-
+const pg = require('pg');                                // <- no destructuring, avoids redeclare traps
 const yahooFinance = require('yahoo-finance2').default;
 const cron = require('node-cron');
 const { v4: uuidv4 } = require('uuid');
 require('dotenv').config();
 
-// Node 18+ has global fetch; add fallback just in case.
+// Node 18+ has global fetch; fallback only if missing
 let fetchFn = global.fetch || (async (...args) => (await import('node-fetch')).default(...args));
 
 const app = express();
@@ -29,8 +30,8 @@ const config = {
   symbols: ['ES=F'],
   timeframes: ['1m', '5m'],
   retentionDays: 45,
-  yahooRateLimit: 250,    // ms between calls to be polite
-  sliceHours: 6,          // size of backfill slices
+  yahooRateLimit: 250,     // ms between Yahoo calls
+  sliceHours: 6,           // backfill slice size in hours
   timezone: 'America/New_York'
 };
 
@@ -48,6 +49,111 @@ const pool = new pg.Pool({
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
 });
 
+// Make pool available to other modules if needed
+app.set('db', pool);
+
+// ---------- Reversal Detector ----------
+
+// ---------- Lightweight Technical Indicators (local, no extra imports) ----------
+const TechnicalIndicators = {
+  // Exponential Moving Average; returns array aligned to input length (leading nulls)
+  ema(values, period) {
+    const out = new Array(values.length).fill(null);
+    if (!values || values.length === 0 || period <= 0) return out;
+    const k = 2 / (period + 1);
+    let emaPrev = null;
+
+    for (let i = 0; i < values.length; i++) {
+      const v = values[i];
+      if (v == null) { out[i] = emaPrev; continue; }
+
+      if (i === 0) {
+        emaPrev = v;
+      } else if (i < period) {
+        // Build a simple SMA seed for stability
+        const start = Math.max(0, i - (period - 1));
+        const slice = values.slice(start, i + 1).filter(x => x != null);
+        const sma = slice.length ? slice.reduce((a,b) => a + b, 0) / slice.length : v;
+        emaPrev = sma;
+      } else {
+        emaPrev = (v - emaPrev) * k + emaPrev;
+      }
+      out[i] = emaPrev;
+    }
+    return out;
+  },
+
+  // RSI (Wilder); returns array aligned to input length (leading nulls)
+  rsi(values, period = 14) {
+    const out = new Array(values.length).fill(null);
+    if (!values || values.length < 2) return out;
+
+    let gains = 0, losses = 0;
+    // seed
+    for (let i = 1; i <= period && i < values.length; i++) {
+      const ch = values[i] - values[i - 1];
+      if (ch > 0) gains += ch; else losses -= ch;
+    }
+    let avgGain = gains / period;
+    let avgLoss = losses / period;
+    out[period] = avgLoss === 0 ? 100 : 100 - (100 / (1 + (avgGain / avgLoss)));
+
+    for (let i = period + 1; i < values.length; i++) {
+      const ch = values[i] - values[i - 1];
+      const gain = ch > 0 ? ch : 0;
+      const loss = ch < 0 ? -ch : 0;
+      avgGain = (avgGain * (period - 1) + gain) / period;
+      avgLoss = (avgLoss * (period - 1) + loss) / period;
+
+      const rs = avgLoss === 0 ? Infinity : avgGain / avgLoss;
+      out[i] = avgLoss === 0 ? 100 : 100 - (100 / (1 + rs));
+    }
+    return out;
+  },
+
+  // ATR (Wilder); returns array aligned to input length (leading nulls)
+  atr(high, low, close, period = 14) {
+    const n = Math.min(high.length, low.length, close.length);
+    const out = new Array(n).fill(null);
+    if (n < 2) return out;
+
+    const tr = new Array(n).fill(null);
+    for (let i = 1; i < n; i++) {
+      const h = high[i], l = low[i], pc = close[i - 1];
+      const tr1 = h - l;
+      const tr2 = Math.abs(h - pc);
+      const tr3 = Math.abs(l - pc);
+      tr[i] = Math.max(tr1, tr2, tr3);
+    }
+
+    // seed ATR with SMA of first 'period' TRs
+    let sum = 0, count = 0;
+    for (let i = 1; i <= period && i < n; i++) {
+      if (tr[i] != null) { sum += tr[i]; count++; }
+    }
+    if (count > 0) out[period] = sum / count;
+
+    for (let i = period + 1; i < n; i++) {
+      out[i] = (out[i - 1] * (period - 1) + tr[i]) / period;
+    }
+    return out;
+  },
+
+  // VWAP using typical price; returns array aligned to input length
+  vwap(high, low, close, volume) {
+    const n = Math.min(high.length, low.length, close.length, volume.length);
+    const out = new Array(n).fill(null);
+    let cumPV = 0, cumV = 0;
+    for (let i = 0; i < n; i++) {
+      const tp = (high[i] + low[i] + close[i]) / 3;
+      const v = volume[i] || 0;
+      cumPV += tp * v;
+      cumV  += v;
+      out[i] = cumV ? (cumPV / cumV) : tp;
+    }
+    return out;
+  }
+};
 
 // ---------- Reversal Detector ----------
 class ReversalDetector {
@@ -88,10 +194,10 @@ class ReversalDetector {
 
   detectReversals(ohlcv, timestamps) {
     const { open, high, low, close, volume } = ohlcv;
-    const rsi = TechnicalIndicators.rsi(close);
-    const atr = TechnicalIndicators.atr(high, low, close);
+    const rsi  = TechnicalIndicators.rsi(close);
+    const atr  = TechnicalIndicators.atr(high, low, close);
     const ema8 = TechnicalIndicators.ema(close, 8);
-    const ema21 = TechnicalIndicators.ema(close, 21);
+    const ema21= TechnicalIndicators.ema(close, 21);
     const vwap = TechnicalIndicators.vwap(high, low, close, volume);
     const relVol = volume.map((v, i) => {
       if (i < 20) return 1.0;
@@ -102,7 +208,13 @@ class ReversalDetector {
 
     const out = [];
     for (let i = 30; i < close.length - 10; i++) {
-      const rev = this.checkReversalConditions(i, { open, high, low, close, volume }, { rsi, atr, ema8, ema21, vwap, relVol }, swings, timestamps[i]);
+      const rev = this.checkReversalConditions(
+        i,
+        { open, high, low, close, volume },
+        { rsi, atr, ema8, ema21, vwap, relVol },
+        swings,
+        timestamps[i]
+      );
       if (rev) out.push(rev);
     }
     return out;
@@ -114,16 +226,20 @@ class ReversalDetector {
 
     const trend = this.checkTrendContext(i, swings);
     if (!trend.hasTrend) return null;
+
     const exhaust = this.checkExhaustion(i, { close, rsi, atr, ema21, vwap, relVol });
     if (!exhaust.hasExhaustion) return null;
+
     const structure = this.checkStructureBreak(i, trend, swings, { high, low });
     if (!structure.hasBreak) return null;
+
     const confirm = this.checkConfirmation(i, { rsi, ema8, ema21, vwap, close });
     if (!confirm.hasConfirmation) return null;
+
     const follow = this.checkFollowThrough(i, { high, low, close }, atr, trend.direction);
     if (!follow.hasFollowThrough) return null;
 
-    // Lightweight scoring to fill base_points/total_points/point_tier
+    // Lightweight scoring for base_points / total_points / point_tier
     let basePoints = 0;
     if (exhaust.atrStretch >= this.cfg.atrStretchMin) basePoints += 2;
     if (relVol[i] >= this.cfg.relVolumeMin) basePoints += 1;
@@ -147,10 +263,10 @@ class ReversalDetector {
       rsi_lookback_max: Math.max(...rsi.slice(Math.max(0, i - 10), i + 1).filter(x => x != null)),
       rsi_lookback_min: Math.min(...rsi.slice(Math.max(0, i - 10), i + 1).filter(x => x != null)),
       move_vs_atr: exhaust.atrStretch ?? 0,
-      price_to_vwap_pct: ((close[i] - vwap[i]) / vwap[i]) * 100,
-      price_to_ema21_pct: ((close[i] - ema21[i]) / ema21[i]) * 100,
-      rel_vol_20: ind.relVol[i],
-      vol_climax_flag: ind.relVol[i] >= this.cfg.relVolumeMin,
+      price_to_vwap_pct: vwap[i] ? ((close[i] - vwap[i]) / vwap[i]) * 100 : 0,
+      price_to_ema21_pct: ema21[i] ? ((close[i] - ema21[i]) / ema21[i]) * 100 : 0,
+      rel_vol_20: relVol[i],
+      vol_climax_flag: relVol[i] >= this.cfg.relVolumeMin,
       ema8_cross_ema21: confirm.emaCross,
       rsi_cross_50: confirm.rsiCross,
       vwap_retest_result: confirm.vwapRetest,
@@ -165,9 +281,9 @@ class ReversalDetector {
   checkTrendContext(index, swings) {
     const look = this.timeframe === '1m' ? 50 : 25;
     const highs = swings.higherHighs.filter(h => h.index < index && h.index > index - look);
-    const lows = swings.lowerLows.filter(l => l.index < index && l.index > index - look);
+    const lows  = swings.lowerLows.filter(l => l.index < index && l.index > index - look);
     if (highs.length >= 3) return { hasTrend: true, direction: 'downtrend', barsSincePeakTrough: index - highs.at(-1).index };
-    if (lows.length >= 3)  return { hasTrend: true, direction: 'uptrend',   barsSincePeakTrough: index - lows.at(-1).index };
+    if (lows.length  >= 3) return { hasTrend: true, direction: 'uptrend',   barsSincePeakTrough: index - lows.at(-1).index };
     return { hasTrend: false };
   }
 
@@ -175,8 +291,8 @@ class ReversalDetector {
     let hasExhaustion = false;
     let atrStretch = 0;
     if (rsi[i] != null && (rsi[i] >= this.cfg.rsiOB || rsi[i] <= this.cfg.rsiOS)) hasExhaustion = true;
-    if (atr[i]) {
-      atrStretch = Math.abs(close[i] - ema21[i]) / atr[i];
+    if (atr[i] != null && ema21[i] != null) {
+      atrStretch = Math.abs(close[i] - ema21[i]) / (atr[i] || 1);
       if (atrStretch >= this.cfg.atrStretchMin) hasExhaustion = true;
     }
     if (relVol[i] >= this.cfg.relVolumeMin) hasExhaustion = true;
@@ -205,15 +321,19 @@ class ReversalDetector {
     let has = false, emaCross = 'none', rsiCross = 'none', vwapRetest = 'none';
     for (let k = i; k <= Math.min(i + this.cfg.confirmBarsMax, close.length - 1); k++) {
       if (k > 0) {
-        if (ema8[k - 1] <= ema21[k - 1] && ema8[k] > ema21[k]) { emaCross = 'up'; has = true; }
-        else if (ema8[k - 1] >= ema21[k - 1] && ema8[k] < ema21[k]) { emaCross = 'down'; has = true; }
+        if (ema8[k - 1] != null && ema21[k - 1] != null && ema8[k] != null && ema21[k] != null) {
+          if (ema8[k - 1] <= ema21[k - 1] && ema8[k] >  ema21[k]) { emaCross = 'up';   has = true; }
+          else if (ema8[k - 1] >= ema21[k - 1] && ema8[k] < ema21[k]) { emaCross = 'down'; has = true; }
+        }
         if (rsi[k - 1] != null && rsi[k] != null) {
           if (rsi[k - 1] <= 50 && rsi[k] > 50) { rsiCross = 'up'; has = true; }
           else if (rsi[k - 1] >= 50 && rsi[k] < 50) { rsiCross = 'down'; has = true; }
         }
       }
-      const vwDist = Math.abs(close[k] - vwap[k]) / vwap[k];
-      if (vwDist < 0.002) { vwapRetest = 'accept'; has = true; }
+      if (vwap[k] != null && vwap[k] !== 0) {
+        const vwDist = Math.abs(close[k] - vwap[k]) / vwap[k];
+        if (vwDist < 0.002) { vwapRetest = 'accept'; has = true; }
+      }
     }
     return { hasConfirmation: has, emaCross, rsiCross, vwapRetest };
   }
@@ -232,6 +352,7 @@ class ReversalDetector {
     return { hasFollowThrough: has, atr: atrVal, bars: barsDir };
   }
 }
+
 
 // ---------- Data Collection Service ----------
 class DataCollectionService {
